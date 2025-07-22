@@ -32,8 +32,8 @@ class GARec(SequentialRecommender):
         self.item_embedding = nn.Embedding(self.n_items, self.hidden_size, padding_idx=0)
         self.mamba_layer = Mamba(
             d_model=self.hidden_size,  # 输入和输出的维度
-            n_layers=2,  # Mamba 层堆叠的数量（可调整）
-            dropout=0.1  # Dropout 概率（与你模型中保持一致）
+            n_layers=2,  # Mamba
+            dropout=0.1  # Dropout
         )
         self.position_embedding = nn.Embedding(self.max_seq_length, self.hidden_size)
         self.feature_embed_layer = FeatureSeqEmbLayer(
@@ -312,16 +312,13 @@ class GARec(SequentialRecommender):
         outputs = self.LayerNorm(outputs)
         return outputs
 
-    def mamba_encoder(self, short_term_seq):
-        """
-        模拟版 Mamba 编码器：接受短期嵌入序列 [B, L, H]，输出同维度的序列编码
-        实际部署时建议替换为 state-spaces/mamba 的官方实现
-        """
-        hidden_size = short_term_seq.size(-1)
+    def mamba_encoder(self, long_term_seq):
+        # do not use , use mamba_ssm.models.mixer_seq_simple instead
+        hidden_size = long_term_seq.size(-1)
         depthwise_conv = nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=1, groups=hidden_size).to(
-            short_term_seq.device)
-        gate_linear = nn.Linear(hidden_size, hidden_size).to(short_term_seq.device)
-        proj_linear = nn.Linear(hidden_size, hidden_size).to(short_term_seq.device)
+            long_term_seq.device)
+        gate_linear = nn.Linear(hidden_size, hidden_size).to(long_term_seq.device)
+        proj_linear = nn.Linear(hidden_size, hidden_size).to(long_term_seq.device)
 
         # depthwise convolution (channel-wise)
         x = short_term_seq.transpose(1, 2)  # [B, H, L]
@@ -329,7 +326,7 @@ class GARec(SequentialRecommender):
         x = x.transpose(1, 2)  # [B, L, H]
 
         # gating
-        gate = torch.sigmoid(gate_linear(short_term_seq))  # [B, L, H]
+        gate = torch.sigmoid(gate_linear(long_term_seq))  # [B, L, H]
         x = gate * x
 
         # projection
