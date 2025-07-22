@@ -11,7 +11,6 @@ from mamba_ssm.models.mixer_seq_simple import Mamba
 class GARec(SequentialRecommender):
     def __init__(self, config, dataset):
         super(GARec, self).__init__(config, dataset)
-        # "Only core code is included. The complete code will be released upon paper acceptance
         # load parameters info
         self.n_layers = config['n_layers']
         self.n_heads = config['n_heads']
@@ -65,7 +64,7 @@ class GARec(SequentialRecommender):
             padding=1
         )
 
-        # 对比学习投影层
+
         self.long_term_item_proj = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.ReLU(),
@@ -152,33 +151,20 @@ class GARec(SequentialRecommender):
         return output
 
     def infonce_loss(self, item_emb, feature_emb, temperature=0.1):
-        """
-        计算InfoNCE对比学习损失
-        Args:
-            item_emb: item嵌入 [batch_size, hidden_size]
-            feature_emb: feature嵌入 [batch_size, hidden_size]
-            temperature: 温度参数
-        Returns:
-            InfoNCE损失值
-        """
+
         batch_size = item_emb.size(0)
 
         # L2标准化
         item_emb = F.normalize(item_emb, p=2, dim=1)
         feature_emb = F.normalize(feature_emb, p=2, dim=1)
 
-        # 计算相似度矩阵
-        # item_emb: [B, D], feature_emb: [B, D]
-        # similarity: [B, B]
         similarity = torch.matmul(item_emb, feature_emb.transpose(0, 1)) / temperature
 
-        # 正样本是对角线元素（同一批次内同一个物品的item和feature嵌入）
         labels = torch.arange(batch_size, device=item_emb.device)
 
-        # 计算InfoNCE损失（从item到feature的方向）
+
         loss_i2f = F.cross_entropy(similarity, labels)
 
-        # 计算InfoNCE损失（从feature到item的方向）
         loss_f2i = F.cross_entropy(similarity.transpose(0, 1), labels)
 
         # 总的对比学习损失
@@ -255,18 +241,15 @@ class GARec(SequentialRecommender):
             short_term_item_final = torch.zeros(batch_size, self.hidden_size, device=item_seq.device)
             short_term_feature_final = torch.zeros(batch_size, self.hidden_size, device=item_seq.device)
 
-        # 对比学习：在门控机制之前进行
-        # 长期item和feature嵌入的对比学习
+
         long_item_proj = self.long_term_item_proj(long_term_item_final)
         long_feature_proj = self.long_term_feature_proj(long_term_feature_final)
         long_contrastive_loss = self.infonce_loss(long_item_proj, long_feature_proj, self.contrastive_temp)
 
-        # 短期item和feature嵌入的对比学习
         short_item_proj = self.short_term_item_proj(short_term_item_final)
         short_feature_proj = self.short_term_feature_proj(short_term_feature_final)
         short_contrastive_loss = self.infonce_loss(short_item_proj, short_feature_proj, self.contrastive_temp)
 
-        # 存储对比学习损失用于后续计算总损失
         self.long_contrastive_loss = long_contrastive_loss
         self.short_contrastive_loss = short_contrastive_loss
 
