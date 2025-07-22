@@ -1,86 +1,109 @@
-
-
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from recbole.model.abstract_recommender import SequentialRecommender
 from recbole.model.layers import TransformerEncoder, FeatureSeqEmbLayer, VanillaAttention
 from recbole.model.loss import BPRLoss
-import torch.nn.functional as F
 from mamba_ssm.models.mixer_seq_simple import Mamba
-# The complete implementation will be made publicly available upon paper acceptance.
+
+
 class GARec(SequentialRecommender):
     def __init__(self, config, dataset):
         super(GARec, self).__init__(config, dataset)
-
+        # "Only core code is included. The complete code will be released upon paper acceptance
         # load parameters info
         self.n_layers = config['n_layers']
         self.n_heads = config['n_heads']
-        self.hidden_size = config['hidden_size']  # same as embedding_size
-        self.inner_size = config['inner_size']  # the dimensionality in feed-forward layer
+        self.hidden_size = config['hidden_size']
+        self.inner_size = config['inner_size']
         self.hidden_dropout_prob = config['hidden_dropout_prob']
         self.attn_dropout_prob = config['attn_dropout_prob']
         self.hidden_act = config['hidden_act']
         self.layer_norm_eps = config['layer_norm_eps']
-
         self.initializer_range = config['initializer_range']
         self.loss_type = config['loss_type']
         self.selected_features = config['selected_features']
         self.pooling_mode = config['pooling_mode']
-        self.num_feature_field = len(config['selected_features'])
-        # define layers and loss
+
+        # 对比学习相关参数
+        self.contrastive_temp = config.get('contrastive_temp', 0.1)  # InfoNCE温度参数
+        self.contrastive_weight = config.get('contrastive_weight', 0.1)  # 对比学习损失权重
+
+        self.q = 2  # 短期序列长度
+
+        # define layers
         self.item_embedding = nn.Embedding(self.n_items, self.hidden_size, padding_idx=0)
-        self.mamba_layer = Mamba(
-            d_model=self.hidden_size,  # 输入和输出的维度
-            n_layers=2,  # Mamba
-            dropout=0.1  # Dropout
-        )
+        self.user_embedding = nn.Embedding(self.n_users, self.hidden_size, padding_idx=0)
         self.position_embedding = nn.Embedding(self.max_seq_length, self.hidden_size)
+
         self.feature_embed_layer = FeatureSeqEmbLayer(
             dataset, self.hidden_size, self.selected_features, self.pooling_mode, self.device
         )
         self.feature_att_layer = VanillaAttention(self.hidden_size, self.hidden_size)
-        self.feature_trm_encoder = TransformerEncoder(
-            n_layers=self.n_layers,
-            n_heads=self.n_heads,
-            hidden_size=self.hidden_size,
-            inner_size=self.inner_size,
-            hidden_dropout_prob=self.hidden_dropout_prob,
-            attn_dropout_prob=self.attn_dropout_prob,
-            hidden_act=self.hidden_act,
-            layer_norm_eps=self.layer_norm_eps
+
+        # Mamba for long-term encoding
+        self.mamba_layer = Mamba(
+            d_model=self.hidden_size,
+            n_layers=2,
+            dropout=self.hidden_dropout_prob
         )
-        self.trm_encoder = TransformerEncoder(
-            n_layers=self.n_layers,
-            n_heads=self.n_heads,
+
+        # LSTM for short-term encoding
+        self.lstm = nn.LSTM(
+            input_size=self.hidden_size,
             hidden_size=self.hidden_size,
-            inner_size=self.inner_size,
-            hidden_dropout_prob=self.hidden_dropout_prob,
-            attn_dropout_prob=self.attn_dropout_prob,
-            hidden_act=self.hidden_act,
-            layer_norm_eps=self.layer_norm_eps
+            batch_first=True,
+            bidirectional=False
+        )
+
+        # Conv1D for short-term preprocessing
+        self.conv1d = nn.Conv1d(
+            in_channels=self.hidden_size,
+            out_channels=self.hidden_size,
+            kernel_size=3,
+            padding=1
+        )
+
+        # 对比学习投影层
+        self.long_term_item_proj = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, self.hidden_size)
+        )
+        self.long_term_feature_proj = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, self.hidden_size)
+        )
+        self.short_term_item_proj = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, self.hidden_size)
+        )
+        self.short_term_feature_proj = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, self.hidden_size)
+        )
+
+        # Gating mechanisms for long-term and short-term fusion
+        self.item_gate = nn.Sequential(
+            nn.Linear(self.hidden_size * 3, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, 2),
+            nn.Softmax(dim=-1)
+        )
+        self.feature_gate = nn.Sequential(
+            nn.Linear(self.hidden_size * 3, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, 2),
+            nn.Softmax(dim=-1)
         )
 
         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
         self.dropout = nn.Dropout(self.hidden_dropout_prob)
-        self.num_groups = 7
-        self.user_group_emb = nn.Embedding(self.num_groups, config["hidden_size"])
-        self.ffn = nn.Linear(self.hidden_size, self.hidden_size)
-        self.ffn2 = nn.Linear(self.hidden_size, self.hidden_size)
-        self.query_layer = nn.Linear(self.hidden_size, self.hidden_size)
-        self.key_layer = nn.Linear(self.hidden_size, self.hidden_size)
-        self.value_layer = nn.Linear(self.hidden_size, self.hidden_size)
-        self.activation_fn = F.relu
-        self.concat_layer = nn.Linear(self.hidden_size*2, self.hidden_size)
-        self.concat_layer2=nn.Linear(self.hidden_size*2,self.hidden_size)
-        self.concat_layer3=nn.Linear(self.hidden_size*3,self.hidden_size)
-        # learnable fileter
-        self.freq_filter= nn.Parameter(torch.randn(1, freq_size,self.hidden_size, dtype=torch.cfloat, device=x.device))
-        # mamba layer
-        self.mamba_layer = Mamba(d_model=self.hidden_size, n_layers=2, dropout=self.hidden_dropout_prob)
-        self.sigmoid=nn.Sigmoid()
-        self.feature_w=nn.Linear(self.hidden_size,self.hidden_size)
-        self.group_w = nn.Linear(self.hidden_size, self.hidden_size)
+        self.final_layer = nn.Linear(self.hidden_size * 4, self.hidden_size)
 
         if self.loss_type == 'BPR':
             self.loss_fct = BPRLoss()
@@ -89,14 +112,10 @@ class GARec(SequentialRecommender):
         else:
             raise NotImplementedError("Make sure 'loss_type' in ['BPR', 'CE']!")
 
-        # parameters initialization
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
-        """ Initialize the weights """
         if isinstance(module, (nn.Linear, nn.Embedding)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.initializer_range)
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
@@ -104,37 +123,85 @@ class GARec(SequentialRecommender):
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
 
-    def get_attention_mask(self, item_seq):
-        """Generate left-to-right uni-directional attention mask for multi-head attention."""
-        attention_mask = (item_seq > 0).long()
-        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # torch.int64
-        # mask for left-to-right unidirectional
-        max_len = attention_mask.size(-1)
-        attn_shape = (1, max_len, max_len)
-        subsequent_mask = torch.triu(torch.ones(attn_shape), diagonal=1)  # torch.uint8
-        subsequent_mask = (subsequent_mask == 0).unsqueeze(1)
-        subsequent_mask = subsequent_mask.long().to(item_seq.device)
-
-        extended_attention_mask = extended_attention_mask * subsequent_mask
-        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
-        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-        return extended_attention_mask
-
     def gather_indexes(self, output, gather_index):
-        """Gathers the vectors at the specific positions over a minibatch"""
         gather_index = gather_index.view(-1, 1, 1).expand(-1, -1, output.shape[-1])
         output_tensor = output.gather(dim=1, index=gather_index)
         return output_tensor.squeeze(1)
 
-    def forward(self, item_seq, item_seq_len):
-        position_ids = torch.arange(item_seq.size(1), dtype=torch.long, device=item_seq.device)
+    def fft_ifft_mamba(self, x):
+        x_freq = torch.fft.rfft(x, dim=1)
+        freq_size = x_freq.size(1)
+        hidden_size = x.size(2)
+
+        if not hasattr(self, 'freq_filter'):
+            self.freq_filter = nn.Parameter(
+                torch.randn(1, freq_size, hidden_size, dtype=torch.cfloat, device=x.device)
+            )
+
+        x_filtered = x_freq * self.freq_filter
+        x_time = torch.fft.irfft(x_filtered, n=x.size(1), dim=1)
+        x_out = self.mamba_layer(x_time)
+        return x_out
+
+    def conv1d_lstm_encoder(self, short_term_seq):
+        x = short_term_seq.transpose(1, 2)
+        x = self.conv1d(x)
+        x = F.relu(x)
+        x = x.transpose(1, 2)
+        output, _ = self.lstm(x)
+        return output
+
+    def infonce_loss(self, item_emb, feature_emb, temperature=0.1):
+        """
+        计算InfoNCE对比学习损失
+        Args:
+            item_emb: item嵌入 [batch_size, hidden_size]
+            feature_emb: feature嵌入 [batch_size, hidden_size]
+            temperature: 温度参数
+        Returns:
+            InfoNCE损失值
+        """
+        batch_size = item_emb.size(0)
+
+        # L2标准化
+        item_emb = F.normalize(item_emb, p=2, dim=1)
+        feature_emb = F.normalize(feature_emb, p=2, dim=1)
+
+        # 计算相似度矩阵
+        # item_emb: [B, D], feature_emb: [B, D]
+        # similarity: [B, B]
+        similarity = torch.matmul(item_emb, feature_emb.transpose(0, 1)) / temperature
+
+        # 正样本是对角线元素（同一批次内同一个物品的item和feature嵌入）
+        labels = torch.arange(batch_size, device=item_emb.device)
+
+        # 计算InfoNCE损失（从item到feature的方向）
+        loss_i2f = F.cross_entropy(similarity, labels)
+
+        # 计算InfoNCE损失（从feature到item的方向）
+        loss_f2i = F.cross_entropy(similarity.transpose(0, 1), labels)
+
+        # 总的对比学习损失
+        contrastive_loss = (loss_i2f + loss_f2i) / 2
+
+        return contrastive_loss
+
+    def forward(self, item_seq, item_seq_len, user_id):
+        batch_size, seq_len = item_seq.size()
+        position_ids = torch.arange(seq_len, dtype=torch.long, device=item_seq.device)
         position_ids = position_ids.unsqueeze(0).expand_as(item_seq)
         position_embedding = self.position_embedding(position_ids)
 
+        # User embeddings
+        user_emb = self.user_embedding(user_id)
+
+        # Item embeddings
         item_emb = self.item_embedding(item_seq)
         input_emb = item_emb + position_embedding
         input_emb = self.LayerNorm(input_emb)
         input_emb = self.dropout(input_emb)
+
+        # Feature embeddings
         sparse_embedding, dense_embedding = self.feature_embed_layer(None, item_seq)
         sparse_embedding = sparse_embedding['item']
         dense_embedding = dense_embedding['item']
@@ -144,237 +211,128 @@ class GARec(SequentialRecommender):
         if dense_embedding is not None:
             feature_table.append(dense_embedding)
         feature_table = torch.cat(feature_table, dim=-2)
-        feature_emb, attn_weight = self.feature_att_layer(feature_table)
-        # feature position add position embedding
+        feature_emb, _ = self.feature_att_layer(feature_table)
         feature_emb = feature_emb + position_embedding
         feature_emb = self.LayerNorm(feature_emb)
-        feature_trm_input = self.dropout(feature_emb)
+        feature_emb = self.dropout(feature_emb)
 
-        extended_attention_mask = self.get_attention_mask(item_seq)
-        feature_trm_output = self.feature_trm_encoder(
-            feature_trm_input, extended_attention_mask, output_all_encoded_layers=True
-        )  # [B Len H]
-        feature_output = feature_trm_output[-1]
-        trm_output = self.trm_encoder(input_emb, extended_attention_mask, output_all_encoded_layers=True)
-        short_term_output = self.gather_indexes(trm_output[-1], item_seq_len - 1)  # [B, H]
-        #256, 50, 64
-        output = trm_output[-1]
-        with torch.no_grad():
-            seq_group = self.multi_head_attention(self.user_group_emb.weight, output,
-                                                  num_units=self.hidden_size,
-                                                  num_heads=self.n_heads,
-                                                  dropout_rate=self.attn_dropout_prob, is_training=True,
-                                                  causality=False)
-            seq_group = self.ffn(seq_group)
-            weigthed_group, attn_weight = self.group_attention(output, seq_group,
-                                                               num_units=self.hidden_size,
-                                                               num_groups=self.num_groups)
-            weigthed_group = self.ffn2(weigthed_group)
-            weigthed_group=torch.mean(weigthed_group,1)
-            # trm_output = self.trm_encoder(input_emb, extended_attention_mask, output_all_encoded_layers=True)
-            # short_term_seq = trm_output[-1]  # [B, L, H]
-            #
-            # # 用 Mamba 编码
-            # short_term_seq_encoded = self.mamba_encoder(short_term_seq)
-            #
-            # short_term_output = self.gather_indexes(short_term_seq_encoded, item_seq_len - 1)
+        # Split sequences into long-term and short-term
+        split_point = max(1, seq_len - self.q)
 
-        #256,64
-        output = self.gather_indexes(output, item_seq_len - 1)
-        feature_output = self.gather_indexes(feature_output, item_seq_len - 1)
-        # output=output+self.weight_1*weigthed_group
-        # output=torch.cat([output,weigthed_group,feature_output],dim=-1)
-        output=torch.cat([output,weigthed_group],dim=-1)
-        output=self.concat_layer(output)
-        # output=torch.cat([output,feature_output],dim=-1)
-        # output=self.concat_layer2(output)
+        # Long-term: [0, split_point)
+        long_term_item = input_emb[:, :split_point, :]
+        long_term_feature = feature_emb[:, :split_point, :]
+
+        # Short-term: [split_point, seq_len)
+        short_term_item = input_emb[:, split_point:, :]
+        short_term_feature = feature_emb[:, split_point:, :]
+
+        # Long-term encoding with FFT + Mamba
+        if long_term_item.size(1) > 0:
+            long_term_item_encoded = self.fft_ifft_mamba(long_term_item)
+            long_term_feature_encoded = self.fft_ifft_mamba(long_term_feature)
+            long_term_item_final = self.gather_indexes(long_term_item_encoded,
+                                                       torch.full((batch_size,), split_point - 1,
+                                                                  dtype=torch.long, device=item_seq.device))
+            long_term_feature_final = self.gather_indexes(long_term_feature_encoded,
+                                                          torch.full((batch_size,), split_point - 1,
+                                                                     dtype=torch.long, device=item_seq.device))
+        else:
+            long_term_item_final = torch.zeros(batch_size, self.hidden_size, device=item_seq.device)
+            long_term_feature_final = torch.zeros(batch_size, self.hidden_size, device=item_seq.device)
+
+        # Short-term encoding with Conv1D + LSTM
+        if short_term_item.size(1) > 0:
+            short_term_item_encoded = self.conv1d_lstm_encoder(short_term_item)
+            short_term_feature_encoded = self.conv1d_lstm_encoder(short_term_feature)
+            short_term_item_final = self.gather_indexes(short_term_item_encoded,
+                                                        torch.full((batch_size,), short_term_item.size(1) - 1,
+                                                                   dtype=torch.long, device=item_seq.device))
+            short_term_feature_final = self.gather_indexes(short_term_feature_encoded,
+                                                           torch.full((batch_size,), short_term_feature.size(1) - 1,
+                                                                      dtype=torch.long, device=item_seq.device))
+        else:
+            short_term_item_final = torch.zeros(batch_size, self.hidden_size, device=item_seq.device)
+            short_term_feature_final = torch.zeros(batch_size, self.hidden_size, device=item_seq.device)
+
+        # 对比学习：在门控机制之前进行
+        # 长期item和feature嵌入的对比学习
+        long_item_proj = self.long_term_item_proj(long_term_item_final)
+        long_feature_proj = self.long_term_feature_proj(long_term_feature_final)
+        long_contrastive_loss = self.infonce_loss(long_item_proj, long_feature_proj, self.contrastive_temp)
+
+        # 短期item和feature嵌入的对比学习
+        short_item_proj = self.short_term_item_proj(short_term_item_final)
+        short_feature_proj = self.short_term_feature_proj(short_term_feature_final)
+        short_contrastive_loss = self.infonce_loss(short_item_proj, short_feature_proj, self.contrastive_temp)
+
+        # 存储对比学习损失用于后续计算总损失
+        self.long_contrastive_loss = long_contrastive_loss
+        self.short_contrastive_loss = short_contrastive_loss
+
+        # Gating mechanisms for dynamic weighting
+        # Item gating: combine user, long-term and short-term item representations
+        item_gate_input = torch.cat([user_emb, long_term_item_final, short_term_item_final], dim=-1)
+        item_weights = self.item_gate(item_gate_input)  # [B, 2]
+
+        # Feature gating: combine user, long-term and short-term feature representations
+        feature_gate_input = torch.cat([user_emb, long_term_feature_final, short_term_feature_final], dim=-1)
+        feature_weights = self.feature_gate(feature_gate_input)  # [B, 2]
+
+        # Apply gating weights
+        weighted_long_item = long_term_item_final * item_weights[:, 0:1]
+        weighted_short_item = short_term_item_final * item_weights[:, 1:2]
+        weighted_long_feature = long_term_feature_final * feature_weights[:, 0:1]
+        weighted_short_feature = short_term_feature_final * feature_weights[:, 1:2]
+
+        # Final user interest representation by concatenating all four embeddings
+        output = torch.cat([weighted_long_item, weighted_short_item,
+                            weighted_long_feature, weighted_short_feature], dim=-1)
+        output = self.final_layer(output)
         output = self.LayerNorm(output)
         output = self.dropout(output)
-        # output = self.multi_source_embedding_fusion(output,feature_output,weigthed_group)
-        return output  # [B H]
 
-    def multi_source_embedding_fusion(self, item_emb, feature_emb,group_emb):
-        hidden_emb=self.attention_based_item_feature_pooling(item_emb,feature_emb,item_seq_len=None)
-        hidden_emb=self.LayerNorm(hidden_emb)
-        hidden_emb=self.dropout(hidden_emb)
-        hidden_emb2=self.attention_based_item_group_pooling(item_emb,group_emb,item_seq_len=None)
-        hidden_emb2=self.LayerNorm(hidden_emb2)
-        hidden_emb2=self.dropout(hidden_emb2)
-        final=self.concat_layer([hidden_emb,hidden_emb2],dim=-1)
-        return final
-
-    def attention_based_item_feature_pooling(self, item_emb, feature_emb, item_seq_len):
-        feature_embedding_value = feature_emb
-        feature_embedding=self.sigmoid(self.feature_w(feature_embedding_value))
-        item_feature_embedding = torch.matmul(feature_embedding, item_emb.unsqueeze(2)).squeeze(-1)
-        return item_feature_embedding
-
-    def attention_based_item_group_pooling(self, item_emb, group_emb, item_seq_len):
-        group_embedding_value = group_emb
-        group_embedding = self.sigmoid(self.group_w(group_embedding_value))
-        item_group_embedding = torch.matmul(group_embedding, item_emb.unsqueeze(2)).squeeze(-1)
-        return item_group_embedding
+        return output
 
     def calculate_loss(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
-        seq_output = self.forward(item_seq, item_seq_len)
+        user_id = interaction[self.USER_ID]
+        seq_output = self.forward(item_seq, item_seq_len, user_id)
 
         pos_items = interaction[self.POS_ITEM_ID]
         if self.loss_type == 'BPR':
             neg_items = interaction[self.NEG_ITEM_ID]
             pos_items_emb = self.item_embedding(pos_items)
             neg_items_emb = self.item_embedding(neg_items)
-            pos_score = torch.sum(seq_output * pos_items_emb, dim=-1)  # [B]
-            neg_score = torch.sum(seq_output * neg_items_emb, dim=-1)  # [B]
-            loss = self.loss_fct(pos_score, neg_score)
-            return loss
-        else:  # self.loss_type = 'CE'
-            test_item_emb = self.item_embedding.weight    # [n_items, H]
-
+            pos_score = torch.sum(seq_output * pos_items_emb, dim=-1)
+            neg_score = torch.sum(seq_output * neg_items_emb, dim=-1)
+            main_loss = self.loss_fct(pos_score, neg_score)
+        else:
+            test_item_emb = self.item_embedding.weight
             logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1))
-            loss = self.loss_fct(logits, pos_items)
-            return loss
+            main_loss = self.loss_fct(logits, pos_items)
+
+        # 添加对比学习损失
+        total_loss = main_loss + self.contrastive_weight * (self.long_contrastive_loss + self.short_contrastive_loss)
+
+        return total_loss
 
     def predict(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
-
+        user_id = interaction[self.USER_ID]
         test_item = interaction[self.ITEM_ID]
-        seq_output = self.forward(item_seq, item_seq_len)
-
+        seq_output = self.forward(item_seq, item_seq_len, user_id)
         test_item_emb = self.item_embedding(test_item)
-
-        # [B H] * [H 1] = [B 1]
-        scores = torch.mul(seq_output, test_item_emb).sum(dim=1)  # [B]
+        scores = torch.mul(seq_output, test_item_emb).sum(dim=1)
         return scores
 
     def full_sort_predict(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
-        seq_output = self.forward(item_seq, item_seq_len)
+        user_id = interaction[self.USER_ID]
+        seq_output = self.forward(item_seq, item_seq_len, user_id)
         test_items_emb = self.item_embedding.weight
-        scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B n_items]
+        scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))
         return scores
-
-    def multi_head_attention(self, queries, keys,
-                             num_units=None,
-                             num_heads=8,
-                             dropout_rate=0,
-                             is_training=True,
-                             causality=False,
-                             ):
-        if num_units is None:
-            num_units = queries.get_shape().as_list[-1]
-        # Linear projections
-        queries = torch.unsqueeze(queries, 0)
-        queries = queries.expand(keys.size(0), -1, -1)
-        Q = self.query_layer(queries)
-        K = self.key_layer(keys)
-        V = self.value_layer(keys)
-        # Split and concat
-        Q_ = torch.cat(torch.split(Q, num_units // num_heads, dim=2), dim=0)
-        K_ = torch.cat(torch.split(K, num_units // num_heads, dim=2), dim=0)
-        V_ = torch.cat(torch.split(V, num_units // num_heads, dim=2), dim=0)
-        # Multiplication
-        outputs = torch.matmul(Q_, K_.transpose(-1, -2))
-        # Scale
-        outputs = outputs / (K_.size(-1) ** 0.5)
-        # Key Masking
-        key_masks = torch.sign(torch.abs(torch.sum(keys, axis=-1)))  # (N, T_k)
-        key_masks = key_masks.repeat(num_heads, 1)
-        key_masks = key_masks.unsqueeze(1).repeat(1, queries.size(1), 1)
-
-        paddings = torch.ones_like(outputs) * (-2 ** 32 + 1)
-        outputs = torch.where(torch.eq(key_masks, 0), paddings, outputs)  # (h*N, T_q, T_k)
-        # Causality = Future blinding
-        if causality:
-            diag_vals = torch.ones_like(outputs[0, :, :])
-            tril = torch.tril(diag_vals)
-            masks = tril.unsqueeze(0).repeat(outputs.size(0), 1, 1)
-
-            paddings = torch.ones_like(masks) * (-2 ** 32 + 1)
-            outputs = torch.where(torch.eq(masks, 0), paddings, outputs)
-        # Activation
-        outputs = F.softmax(outputs, dim=-1)
-        # Query Masking
-        query_masks = torch.sign(torch.abs(torch.sum(queries, axis=-1)))
-        query_masks = query_masks.repeat(num_heads, 1)
-        query_masks = query_masks.unsqueeze(-1).repeat(1, 1, keys.size(1))
-        outputs *= query_masks
-        # Dropouts
-        outputs = F.dropout(outputs, training=is_training, p=dropout_rate)
-        # Weighted sum
-        outputs = torch.matmul(outputs, V_)
-        # Restore shape
-        outputs = torch.cat(torch.split(outputs, outputs.size(0) // num_heads, dim=0), dim=2)
-        # Residual connection
-        outputs += queries
-        # Normalize
-        outputs = self.LayerNorm(outputs)
-        return outputs
-
-    def fft_ifft_mamba(self, x):
-
-        x_freq = torch.fft.rfft(x, dim=1)  # [B, F, H], complex
-
-        freq_size = x_freq.size(1)
-        hidden_size = x.size(2)
-        if not hasattr(self, 'freq_filter'):
-            self.freq_filter = nn.Parameter(
-                torch.randn(1, freq_size, hidden_size, dtype=torch.cfloat, device=x.device)
-            )
-        x_filtered = x_freq * self.freq_filter  # [B, F, H]
-
-        x_time = torch.fft.irfft(x_filtered, n=x.size(1), dim=1)  # [B, L, H], 实数
-        x_out = self.mamba_layer(x_time)  # [B, L, H]
-
-        return x_out
-
-    def  group_attention(self,queries,
-                            keys,
-                            num_units=None,
-                            num_groups=None):
-        if num_units is None:
-            num_units = queries.get_shape().as_list[-1]
-        queries = queries.transpose(1, 2)#E
-        q_projection=nn.Linear(queries.size(-1),num_groups,bias=False).to(queries.device)
-        # q_projection=nn.Linear(queries.size(-1),num_units,bias=False).to(queries.device)
-        v_projection=nn.Linear(keys.size(-1),num_units,bias=False).to(queries.device)
-        queries=q_projection(queries)
-        queries=queries.transpose(1,2)
-
-        v=v_projection(keys)#G
-        outputs=queries
-        layer_sizes=[1]
-        for idx, layer_size in enumerate(layer_sizes):
-            curr_w_nn_layer = nn.Linear(outputs.size(-1), layer_size).to(queries.device)
-            outputs = curr_w_nn_layer(outputs)
-            outputs = self.activation_fn(outputs)
-        nn_output = outputs
-        attn_weight=F.softmax(nn_output,dim=1)
-        outputs=torch.multiply(attn_weight,v)
-        return outputs,attn_weight
-def conv1d_lstm_encoder(self, short_term_seq):
-    """
-    Conv1D + LSTM 编码短期兴趣序列表示
-    输入: short_term_seq [B, L, H]
-    输出: 编码后的短期兴趣序列 [B, L, H]
-    """
-    hidden_size = short_term_seq.size(-1)
-    conv_channels = hidden_size  # 或者设为不同值
-    kernel_size = 3
-
-    conv1d = nn.Conv1d(in_channels=hidden_size, out_channels=conv_channels,
-                       kernel_size=kernel_size, padding=kernel_size // 2).to(short_term_seq.device)
-    lstm = nn.LSTM(input_size=conv_channels, hidden_size=hidden_size,
-                   batch_first=True, bidirectional=False).to(short_term_seq.device)
-
-    # Conv1D expects input shape [B, C_in, L]
-    x = short_term_seq.transpose(1, 2)         # [B, H, L]
-    x = conv1d(x)                              # [B, C, L]
-    x = F.relu(x)
-    x = x.transpose(1, 2)                      # [B, L, C]
-    output, _ = lstm(x)                        # [B, L, H]
-    return output
-
