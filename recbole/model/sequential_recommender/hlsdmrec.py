@@ -74,6 +74,10 @@ class GARec(SequentialRecommender):
         self.concat_layer = nn.Linear(self.hidden_size*2, self.hidden_size)
         self.concat_layer2=nn.Linear(self.hidden_size*2,self.hidden_size)
         self.concat_layer3=nn.Linear(self.hidden_size*3,self.hidden_size)
+        # learnable fileter
+        self.freq_filter= nn.Parameter(torch.randn(1, freq_size,self.hidden_size, dtype=torch.cfloat, device=x.device))
+        # mamba layer
+        self.mamba_layer = Mamba(d_model=self.hidden_size, n_layers=2, dropout=self.hidden_dropout_prob)
         self.sigmoid=nn.Sigmoid()
         self.feature_w=nn.Linear(self.hidden_size,self.hidden_size)
         self.group_w = nn.Linear(self.hidden_size, self.hidden_size)
@@ -145,8 +149,6 @@ class GARec(SequentialRecommender):
         feature_emb = feature_emb + position_embedding
         feature_emb = self.LayerNorm(feature_emb)
         feature_trm_input = self.dropout(feature_emb)
-
-
 
         extended_attention_mask = self.get_attention_mask(item_seq)
         feature_trm_output = self.feature_trm_encoder(
@@ -312,27 +314,23 @@ class GARec(SequentialRecommender):
         outputs = self.LayerNorm(outputs)
         return outputs
 
-    def mamba_encoder(self, long_term_seq):
-        # do not use , use mamba_ssm.models.mixer_seq_simple instead
-        hidden_size = long_term_seq.size(-1)
-        depthwise_conv = nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=1, groups=hidden_size).to(
-            long_term_seq.device)
-        gate_linear = nn.Linear(hidden_size, hidden_size).to(long_term_seq.device)
-        proj_linear = nn.Linear(hidden_size, hidden_size).to(long_term_seq.device)
+    def fft_ifft_mamba(self, x):
 
-        # depthwise convolution (channel-wise)
-        x = short_term_seq.transpose(1, 2)  # [B, H, L]
-        x = depthwise_conv(x)  # [B, H, L]
-        x = x.transpose(1, 2)  # [B, L, H]
+        x_freq = torch.fft.rfft(x, dim=1)  # [B, F, H], complex
 
-        # gating
-        gate = torch.sigmoid(gate_linear(long_term_seq))  # [B, L, H]
-        x = gate * x
+        freq_size = x_freq.size(1)
+        hidden_size = x.size(2)
+        if not hasattr(self, 'freq_filter'):
+            self.freq_filter = nn.Parameter(
+                torch.randn(1, freq_size, hidden_size, dtype=torch.cfloat, device=x.device)
+            )
+        x_filtered = x_freq * self.freq_filter  # [B, F, H]
 
-        # projection
-        output = proj_linear(x)  # [B, L, H]
-        return output
-    
+        x_time = torch.fft.irfft(x_filtered, n=x.size(1), dim=1)  # [B, L, H], 实数
+        x_out = self.mamba_layer(x_time)  # [B, L, H]
+
+        return x_out
+
     def  group_attention(self,queries,
                             keys,
                             num_units=None,
