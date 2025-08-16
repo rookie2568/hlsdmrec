@@ -8,7 +8,14 @@ HLSDMRec works with the following operating systems:
 
 HLSDMRec requires Python version 3.7 or later.
 
-Our core code located in recbole/model/sequential_recommender/hlsdmrec
+Our core code located in recbole/model/sequential_recommender/HLSDMRec
+##Update: Now our codebase contains 3 Variant##
+plz check recbole/model/sequential_recommender/HLSDMRec_Variant_A and HLSDMRec_Variant_B and HLSDMRec_OverLap
+HLSDMRec_Variant_A: use transformer encoder to encode short term preference
+HLSDMRec_Variant_B: use gru to encode short term preference
+HLSDMRec_OverLap： the long term sequence is overlap with short term sequence
+
+
 
 HLSDMRec requires torch version 1.7.0 or later. If you want to use HLSDMRec with GPU, please ensure that CUDA or cudatoolkit version is 9.2 or later. This requires NVIDIA driver version >= 396.26 (for Linux) or >= 397.44 (for Windows10).
 
