@@ -9,10 +9,14 @@ HLSDMRec works with the following operating systems:
 HLSDMRec requires Python version 3.7 or later.
 
 Our core code located in recbole/model/sequential_recommender/HLSDMRec
-##Update: Now our codebase contains 3 Variant##
+## ***Update: Now our codebase contains 3 Variant***
+
 plz check recbole/model/sequential_recommender/HLSDMRec_Variant_A and HLSDMRec_Variant_B and HLSDMRec_OverLap
+
 HLSDMRec_Variant_A: use transformer encoder to encode short term preference
+
 HLSDMRec_Variant_B: use gru to encode short term preference
+
 HLSDMRec_OverLap： the long term sequence is overlap with short term sequence
 
 
